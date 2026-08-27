@@ -1,317 +1,146 @@
-import streamlit as st
-import cv2
+import re
+from io import BytesIO
+import easyocr
+import matplotlib.pyplot as plt
 import numpy as np
-import pytesseract
-import pandas as pd
-import json
-import difflib
-import pypdfium2 as pdfium
+from PIL import Image, ImageEnhance, ImageFilter
+import streamlit as st
 
-# =====================================================================
-# Constants & Defaults
-# =====================================================================
-OCR_LANG_OPTIONS = {
-    "Nepali (nep)": "nep",
-    "English (eng)": "eng",
-    "Devanagari Script (deva)": "script/Devanagari",
-    "Nepali + Devanagari": "nep+script/Devanagari",
-    "English + Nepali": "eng+nep"
-}
+# Set page configuration
+st.set_page_config(
+    page_title="Nepali IDP & KYC Extractor", page_icon="🪪", layout="wide"
+)
 
-DEFAULT_ROIS = {
-    "citizenship": {
-        "Citizenship Number": (0.05, 0.15, 0.40, 0.08),
-        "Full Name": (0.05, 0.25, 0.60, 0.08),
-        "Date of Birth": (0.05, 0.35, 0.40, 0.08),
-        "Father's Name": (0.05, 0.45, 0.60, 0.08),
-        "District of Issue": (0.05, 0.55, 0.40, 0.08),
-    },
-    "kyc": {
-        "Citizenship Number": (0.10, 0.20, 0.40, 0.05),
-        "Full Name": (0.10, 0.30, 0.60, 0.05),
-        "Date of Birth": (0.10, 0.40, 0.40, 0.05),
-        "Father's Name": (0.10, 0.50, 0.60, 0.05),
-        "District of Issue": (0.10, 0.60, 0.40, 0.05),
-    }
-}
 
-# =====================================================================
-# Helper Functions
-# =====================================================================
-def check_tesseract():
-    """Verify if Tesseract is installed and accessible."""
-    try:
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
+# Initialize EasyOCR Reader for Nepali ('ne') and English ('en') once using caching
+@st.cache_resource
+def load_ocr_reader():
+  return easyocr.Reader(["ne", "en"])
 
-def load_document_pages(uploaded_file):
-    """Load PDFs using pypdfium2 or image files into a list of OpenCV BGR images."""
-    pages = []
-    warnings = []
-    try:
-        file_bytes = uploaded_file.read()
-        if uploaded_file.name.lower().endswith(".pdf"):
-            pdf_doc = pdfium.PdfDocument(file_bytes)
-            for i in range(len(pdf_doc)):
-                page = pdf_doc[i]
-                image = page.render(scale=2.0).to_pil() # 2x scale for better OCR clarity
-                pages.append(cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
-        else:
-            nparr = np.asarray(bytearray(file_bytes), dtype=np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                pages.append(img)
-            else:
-                warnings.append("Could not decode image file.")
-    except Exception as e:
-        warnings.append(f"Error loading document: {str(e)}")
-    
-    return pages, warnings
 
-def preprocess_image(img, denoise_strength):
-    """Convert to grayscale, denoise, and binarize for OCR."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if denoise_strength > 0:
-        gray = cv2.fastNlMeansDenoising(gray, h=denoise_strength)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return thresh
+reader = load_ocr_reader()
 
-def extract_fields_from_document(pages, roi_config, denoise_strength, ocr_lang):
-    """Extract text from designated Regions of Interest (ROI)."""
-    if not pages:
-        return {"fields": {}, "confidences": {}, "overlays": [], "warnings": ["No pages to process."]}
 
-    base_img = pages[0]
-    height, width = base_img.shape[:2]
-    
-    overlay_img = base_img.copy()
-    fields = {}
-    confidences = {}
-    warnings = []
+def scan_effect(img):
+  """Enhances image contrast and sharpness for better OCR accuracy on identity documents."""
+  gray_img = img.convert("L")
+  enhancer = ImageEnhance.Contrast(gray_img)
+  contrast_img = enhancer.enhance(2.0)
+  sharp_img = contrast_img.filter(ImageFilter.SHARPEN)
+  return sharp_img
 
-    custom_config = r'--oem 3 --psm 6'
-    
-    for field_name, (fx, fy, fw, fh) in roi_config.items():
-        x, y = int(fx * width), int(fy * height)
-        w, h = int(fw * width), int(fh * height)
-        
-        roi = base_img[y:y+h, x:x+w]
-        
-        if roi.size == 0:
-            warnings.append(f"Invalid crop for field: {field_name}")
-            continue
-            
-        processed_roi = preprocess_image(roi, denoise_strength)
-        
-        cv2.rectangle(overlay_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
-        cv2.putText(overlay_img, field_name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        try:
-            text = pytesseract.image_to_string(processed_roi, lang=ocr_lang, config=custom_config).strip()
-            data = pytesseract.image_to_data(processed_roi, lang=ocr_lang, config=custom_config, output_type=pytesseract.Output.DICT)
-            confs = [int(c) for c in data['conf'] if int(c) != -1]
-            avg_conf = sum(confs) / len(confs) if confs else 0
-            
-            fields[field_name] = text
-            confidences[field_name] = avg_conf
-        except Exception as e:
-            warnings.append(f"OCR Error on {field_name}: {str(e)}")
-            fields[field_name] = ""
-            confidences[field_name] = 0
+def extract_kyc_fields(ocr_texts):
+  """Applies heuristic regex patterns to extract structured KYC details from raw OCR text lines."""
+  kyc_data = {
+      "Citizenship Number": None,
+      "Date of Birth (DOB)": None,
+      "Raw Extracted Text": ocr_texts,
+  }
 
-    return {
-        "fields": fields,
-        "confidences": confidences,
-        "overlays": [cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)],
-        "warnings": warnings
-    }
+  # Regular expression heuristics for Nepali citizenship patterns
+  cit_pattern = re.compile(r"\d{2}-\d{2}-\d{2}-\d{5}|\d{4}-\d{2}-\d{2}-\d{4}")
+  dob_pattern = re.compile(
+      r"\b(?:20\d{2}|19\d{2})[./-]\d{1,2}[./-]\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-]20\d{2}\b"
+  )
 
-def string_similarity(a, b):
-    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+  for text in ocr_texts:
+    if not kyc_data["Citizenship Number"]:
+      match_cit = cit_pattern.search(text)
+      if match_cit:
+        kyc_data["Citizenship Number"] = match_cit.group()
 
-def compare_fields(cit_fields, kyc_fields, threshold):
-    results = []
-    for field in cit_fields.keys():
-        val1 = cit_fields.get(field, "").strip()
-        val2 = kyc_fields.get(field, "").strip()
-        
-        if not val1 and not val2:
-            sim = 0.0
-            status = "Missing"
-        else:
-            sim = string_similarity(val1, val2)
-            if sim >= threshold:
-                status = "Match"
-            elif sim >= threshold - 15:
-                status = "Review"
-            else:
-                status = "Mismatch"
-                
-        results.append({
-            "Field": field,
-            "Citizenship Certificate": val1,
-            "KYC Form": val2,
-            "Similarity (%)": round(sim, 1),
-            "Status": status
-        })
-    return results
+    if not kyc_data["Date of Birth (DOB)"]:
+      match_dob = dob_pattern.search(text)
+      if match_dob:
+        kyc_data["Date of Birth (DOB)"] = match_dob.group()
 
-def compute_overall_status(comparison_rows):
-    if not comparison_rows:
-        return "rejected", "NO DATA"
-    statuses = [r["Status"] for r in comparison_rows]
-    if "Mismatch" in statuses:
-        return "rejected", "MISMATCH DETECTED"
-    elif "Review" in statuses or "Missing" in statuses:
-        return "review", "MANUAL REVIEW REQUIRED"
-    else:
-        return "approved", "VERIFIED & APPROVED"
+  return kyc_data
 
-def apply_status_styles(df):
-    def color_status(val):
-        if val == "Match":
-            return "color: green; font-weight: bold;"
-        elif val == "Review":
-            return "color: orange; font-weight: bold;"
-        elif val == "Mismatch":
-            return "color: red; font-weight: bold;"
-        return ""
-    return df.style.map(color_status, subset=["Status"])
 
-# =====================================================================
-# UI Elements
-# =====================================================================
-def render_sidebar():
-    st.sidebar.title("⚙️ IDP Pipeline Settings")
-    
-    tesseract_ok = check_tesseract()
-    if tesseract_ok:
-        st.sidebar.success("✅ Tesseract Engine Ready")
-    else:
-        st.sidebar.error("❌ Tesseract Engine Not Found.")
+# --- Streamlit UI Layout ---
+st.title("🪪 Intelligent Document Processing (IDP) - KYC Extractor")
+st.markdown(
+    "Automated Devanagari OCR pipeline built to extract structured KYC fields"
+    " from Nepali identity documents."
+)
 
-    st.sidebar.markdown("### OCR Configuration")
-    lang_choice = st.sidebar.selectbox("OCR Language Mode", list(OCR_LANG_OPTIONS.keys()), index=2)
-    ocr_lang = OCR_LANG_OPTIONS[lang_choice]
-    
-    st.sidebar.markdown("### Image Preprocessing")
-    denoise_strength = st.sidebar.slider("Denoising Strength", 0, 20, 10)
-    
-    st.sidebar.markdown("### Matching Logic")
-    match_threshold = st.sidebar.slider("Fuzzy Match Threshold (%)", 50, 100, 85)
+uploaded_file = st.file_uploader(
+    "Upload Nepali Citizenship / ID Document", type=["jpg", "jpeg", "png"]
+)
 
-    if "roi_config" not in st.session_state:
-        st.session_state.roi_config = DEFAULT_ROIS
+if uploaded_file is not None:
+  col1, col2 = st.columns(2)
 
-    return {
-        "ocr_lang": ocr_lang,
-        "match_threshold": match_threshold,
-        "denoise_strength": denoise_strength,
-        "tesseract_ok": tesseract_ok,
-    }
+  with col1:
+    st.subheader("Original Document")
+    image = Image.open(uploaded_file)
+    st.image(image, use_column_width=True)
 
-def main():
-    st.set_page_config(page_title="Nepal KYC IDP", layout="wide")
-    settings = render_sidebar()
+  # Process image
+  scanned_image = scan_effect(image)
 
-    st.markdown("""
-        <style>
-        .kyc-header { display: flex; align-items: center; gap: 20px; padding-bottom: 10px; }
-        .kyc-flagbar { font-size: 3rem; }
-        .kyc-rule { border-bottom: 2px solid #ccc; margin-bottom: 20px; }
-        .kyc-stamp { 
-            border: 4px solid; padding: 20px; text-align: center; 
-            font-size: 1.5rem; font-weight: bold; border-radius: 10px; 
-            text-transform: uppercase; margin: 10px 0;
-            display: inline-block; transform: rotate(-5deg);
-        }
-        .kyc-stamp--approved { color: #28a745; border-color: #28a745; }
-        .kyc-stamp--rejected { color: #dc3545; border-color: #dc3545; }
-        .kyc-stamp--review { color: #ffc107; border-color: #ffc107; }
-        .kyc-stamp-sub { display: block; font-size: 0.8rem; margin-top: 5px; opacity: 0.8; }
-        </style>
-    """, unsafe_allow_html=True)
+  with col2:
+    st.subheader("Enhanced Scan Layer")
+    st.image(scanned_image, use_column_width=True)
 
-    st.markdown(
-        """
-        <div class="kyc-header">
-            <div class="kyc-flagbar">🪪</div>
-            <div>
-                <h1 style="margin-bottom:0;">Nepal KYC IDP Portal</h1>
-                <p style="margin-top:0; color: gray;">Intelligent Document Processing & Automated Cross-Verification</p>
-            </div>
-        </div>
-        <div class="kyc-rule"></div>
-        """,
-        unsafe_allow_html=True,
+  with st.spinner("Extracting Devanagari text and structuring KYC fields..."):
+    # Run EasyOCR
+    output = reader.readtext(np.array(scanned_image))
+    detected_texts = [text for (_, text, _) in output]
+    kyc_results = extract_kyc_fields(detected_texts)
+
+  # --- Results Section ---
+  st.markdown("---")
+  st.subheader("📊 Structured KYC Output")
+
+  m_col1, m_col2 = st.columns(2)
+  with m_col1:
+    st.metric(
+        label="Extracted Citizenship ID",
+        value=(
+            kyc_results["Citizenship Number"]
+            if kyc_results["Citizenship Number"]
+            else "Not Automatically Detected"
+        ),
+    )
+  with m_col2:
+    st.metric(
+        label="Detected Date of Birth",
+        value=(
+            kyc_results["Date of Birth (DOB)"]
+            if kyc_results["Date of Birth (DOB)"]
+            else "Not Automatically Detected"
+        ),
     )
 
-    if not settings["tesseract_ok"]:
-        st.error("⚠️ Tesseract OCR is not accessible. Check your packages.txt file.")
-        st.stop()
+  # Display Bounding Boxes & Visual Overlays
+  st.subheader("🔍 OCR Bounding Box Overlay")
+  fig, ax = plt.subplots(figsize=(8, 6))
+  ax.imshow(scanned_image, cmap="gray")
 
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        st.markdown("### 1. Citizenship Certificate")
-        cit_file = st.file_uploader("Upload Citizenship File", type=["jpg", "jpeg", "png", "pdf"], key="cit_upload")
+  for bbox, text, conf in output:
+    rect_x = [p[0] for p in bbox]
+    rect_y = [p[1] for p in bbox]
+    ax.plot(rect_x + [rect_x[0]], rect_y + [rect_y[0]], "r-", linewidth=2)
+    ax.text(
+        rect_x[0],
+        rect_y[0] - 5,
+        f"{text} ({conf:.2f})",
+        color="yellow",
+        fontsize=9,
+        backgroundcolor="black",
+    )
 
-    with col_up2:
-        st.markdown("### 2. KYC Form")
-        kyc_file = st.file_uploader("Upload KYC Form File", type=["jpg", "jpeg", "png", "pdf"], key="kyc_upload")
+  ax.axis("off")
+  st.pyplot(fig)
 
-    if not cit_file or not kyc_file:
-        st.info("👆 Please upload both documents above to begin cross-verification.")
-        return
+  # Expandable raw text & JSON view
+  with st.expander("View Full Raw OCR Breakdown & JSON"):
+    for i, (bbox, text, confidence) in enumerate(output):
+      st.write(f"**{i+1}.** {text} *(Confidence: {confidence:.2f})*")
 
-    cit_pages, cit_warnings = load_document_pages(cit_file)
-    kyc_pages, kyc_warnings = load_document_pages(kyc_file)
+    st.json(kyc_results)
 
-    for w in cit_warnings:
-        st.warning(f"Citizenship warning: {w}")
-    for w in kyc_warnings:
-        st.warning(f"KYC warning: {w}")
-
-    if not cit_pages or not kyc_pages:
-        st.error("Could not process uploaded files.")
-        return
-
-    with st.spinner(f"Extracting text (OCR Language: {settings['ocr_lang']})..."):
-        cit_result = extract_fields_from_document(
-            cit_pages, st.session_state.roi_config["citizenship"], settings["denoise_strength"], settings["ocr_lang"]
-        )
-        kyc_result = extract_fields_from_document(
-            kyc_pages, st.session_state.roi_config["kyc"], settings["denoise_strength"], settings["ocr_lang"]
-        )
-
-    comparison_rows = compare_fields(cit_result["fields"], kyc_result["fields"], settings["match_threshold"])
-    df_compare = pd.DataFrame(comparison_rows)
-    stamp_class, stamp_text = compute_overall_status(comparison_rows)
-
-    st.markdown("---")
-    st.markdown("### 🔍 Verification & Cross-Check Results")
-
-    res_col1, res_col2 = st.columns([1.2, 1])
-
-    with res_col1:
-        st.markdown("#### Field-by-Field Reconciliation")
-        display_df = df_compare[["Field", "Citizenship Certificate", "KYC Form", "Similarity (%)", "Status"]]
-        st.dataframe(apply_status_styles(display_df), use_container_width=True, hide_index=True)
-
-    with res_col2:
-        st.markdown("#### Audit Decision Stamp")
-        st.markdown(
-            f"""
-            <div style="text-align: center; padding: 1rem;">
-                <div class="kyc-stamp kyc-stamp--{stamp_class}">
-                    {stamp_text}
-                    <span class="kyc-stamp-sub">Nepal IDP Gateway</span>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-if __name__ == "__main__":
-    main()
+else:
+  st.info("Please upload a scan or clear photo of a Nepali identity document.")
