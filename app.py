@@ -12,13 +12,18 @@ st.set_page_config(
 )
 
 
-# Initialize EasyOCR Reader for Nepali ('ne') and English ('en') once using caching
+# --- Step 2: Robust Caching for Model Loading ---
+# Setting gpu=False ensures stability on CPU-based cloud environments like Streamlit Cloud
 @st.cache_resource
 def load_ocr_reader():
-  return easyocr.Reader(["ne", "en"])
+  return easyocr.Reader(["ne", "en"], gpu=False)
 
 
-reader = load_ocr_reader()
+# Display a loading message while downloading/initializing weights on first boot
+with st.spinner(
+    "Loading OCR models (this may take a moment on first boot)..."
+):
+  reader = load_ocr_reader()
 
 
 def scan_effect(img):
@@ -38,7 +43,6 @@ def extract_kyc_fields(ocr_texts):
       "Raw Extracted Text": ocr_texts,
   }
 
-  # Regular expression heuristics for Nepali citizenship patterns
   cit_pattern = re.compile(r"\d{2}-\d{2}-\d{2}-\d{5}|\d{4}-\d{2}-\d{2}-\d{4}")
   dob_pattern = re.compile(
       r"\b(?:20\d{2}|19\d{2})[./-]\d{1,2}[./-]\d{1,2}\b|\b\d{1,2}[./-]\d{1,2}[./-]20\d{2}\b"
@@ -77,7 +81,6 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file)
     st.image(image, use_container_width=True)
 
-  # Process image
   scanned_image = scan_effect(image)
 
   with col2:
@@ -85,12 +88,10 @@ if uploaded_file is not None:
     st.image(scanned_image, use_container_width=True)
 
   with st.spinner("Extracting Devanagari text and structuring KYC fields..."):
-    # Run EasyOCR
     output = reader.readtext(np.array(scanned_image))
     detected_texts = [text for (_, text, _) in output]
     kyc_results = extract_kyc_fields(detected_texts)
 
-  # --- Results Section ---
   st.markdown("---")
   st.subheader("📊 Structured KYC Output")
 
@@ -114,7 +115,6 @@ if uploaded_file is not None:
         ),
     )
 
-  # Display Bounding Boxes & Visual Overlays
   st.subheader("🔍 OCR Bounding Box Overlay")
   fig, ax = plt.subplots(figsize=(8, 6))
   ax.imshow(scanned_image, cmap="gray")
@@ -135,12 +135,9 @@ if uploaded_file is not None:
   ax.axis("off")
   st.pyplot(fig)
 
-  # Expandable raw text & JSON view
   with st.expander("View Full Raw OCR Breakdown & JSON"):
     for i, (bbox, text, confidence) in enumerate(output):
       st.write(f"**{i+1}.** {text} *(Confidence: {confidence:.2f})*")
-
     st.json(kyc_results)
-
 else:
   st.info("Please upload a scan or clear photo of a Nepali identity document.")
