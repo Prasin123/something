@@ -75,14 +75,14 @@ if uploaded_file is not None:
   with col1:
     st.subheader("Original Document")
     image = Image.open(uploaded_file)
-    st.image(image, use_column_width=True)
+    st.image(image, use_container_width=True)
 
   # Process image
   scanned_image = scan_effect(image)
 
   with col2:
     st.subheader("Enhanced Scan Layer")
-    st.image(scanned_image, use_column_width=True)
+    st.image(scanned_image, use_container_width=True)
 
   with st.spinner("Extracting Devanagari text and structuring KYC fields..."):
     # Run EasyOCR
