@@ -1,3 +1,4 @@
 tesseract-ocr
 tesseract-ocr-script-deva
 tesseract-ocr-nep
+poppler-utils
